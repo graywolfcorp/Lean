@@ -16,12 +16,15 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Threading;
+using System.Threading.Tasks;
 using NodaTime;
 using QuantConnect.Brokerages.Alpaca.Markets;
 using QuantConnect.Data.Market;
 using QuantConnect.Logging;
 using QuantConnect.Orders;
 using QuantConnect.Orders.Fees;
+using QuantConnect.Securities;
 using OrderStatus = QuantConnect.Orders.OrderStatus;
 
 namespace QuantConnect.Brokerages.Alpaca
@@ -53,11 +56,22 @@ namespace QuantConnect.Brokerages.Alpaca
                 TickType = TickType.Quote
             };
         }
-        private IOrder GenerateAndPlaceOrder(Order order)
+
+        private void GenerateAndPlaceOrder(Order order)
         {
+            var holdingQuantity = _securityProvider.GetHoldingsQuantity(order.Symbol);
+
+            var orderCrossesZero = OrderCrossesZero(order.Quantity, holdingQuantity);
+
             var quantity = (long)order.Quantity;
             var side = order.Quantity > 0 ? OrderSide.Buy : OrderSide.Sell;
             if (order.Quantity < 0) quantity = -quantity;
+
+            if (orderCrossesZero)
+            {
+                quantity = (long)Math.Abs(holdingQuantity);
+            }
+
             Markets.OrderType type;
             decimal? limitPrice = null;
             decimal? stopPrice = null;
@@ -100,7 +114,47 @@ namespace QuantConnect.Brokerages.Alpaca
 
             var apOrder = task.SynchronouslyAwaitTaskResult();
 
-            return apOrder;
+            order.BrokerId.Add(apOrder.OrderId.ToString());
+
+            if (orderCrossesZero)
+            {
+                Task.Run(() =>
+                {
+                    // wait for the fill of the position closing order
+                    var orderFilledEvent = new ManualResetEvent(false);
+                    EventHandler<OrderEvent> orderStatusChangedEventHandler =
+                        (sender, e) =>
+                        {
+                            if (e.OrderId == order.Id && e.Status == OrderStatus.Filled)
+                            {
+                                orderFilledEvent.Set();
+                            }
+                        };
+
+                    OrderStatusChanged += orderStatusChangedEventHandler;
+
+                    if (!orderFilledEvent.WaitOne(5000))
+                    {
+                        Log.Error($"Timeout waiting for Alpaca order fill, orderId: {order.Id}");
+                    }
+                    else
+                    {
+                        Console.WriteLine($"Closing order filled, orderId: {order.Id}");
+                    }
+
+                    OrderStatusChanged -= orderStatusChangedEventHandler;
+
+                    // submit the order for the remaining quantity
+                    var secondOrderQuantity = order.Quantity + holdingQuantity;
+
+                    task = _restClient.PostOrderAsync(order.Symbol.Value, (long)secondOrderQuantity, side, type, timeInForce,
+                        limitPrice, stopPrice);
+
+                    apOrder = task.SynchronouslyAwaitTaskResult();
+
+                    order.BrokerId.Add(apOrder.OrderId.ToString());
+                });
+            }
         }
 
         /// <summary>
@@ -430,5 +484,32 @@ namespace QuantConnect.Brokerages.Alpaca
                 _messagingRateLimiter.WaitToProceed();
             }
         }
+
+        /// <summary>
+        /// Determines whether or not the specified order will bring us across the zero line for holdings
+        /// </summary>
+        private static bool OrderCrossesZero(decimal orderQuantity, decimal holdingQuantity)
+        {
+            // We're reducing position or flipping
+            if (holdingQuantity > 0 && orderQuantity < 0)
+            {
+                if (holdingQuantity + orderQuantity < 0)
+                {
+                    // flipping from Long to Short
+                    return true;
+                }
+            }
+            else if (holdingQuantity < 0 && orderQuantity > 0)
+            {
+                if (holdingQuantity + orderQuantity > 0)
+                {
+                    // flipping from Short to Long
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
     }
 }

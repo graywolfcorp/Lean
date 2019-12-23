@@ -300,8 +300,7 @@ namespace QuantConnect.Brokerages.Alpaca
             {
                 lock (_locker)
                 {
-                    var apOrder = GenerateAndPlaceOrder(order);
-                    order.BrokerId.Add(apOrder.OrderId.ToString());
+                    GenerateAndPlaceOrder(order);
                 }
             }
             catch (Exception e)
